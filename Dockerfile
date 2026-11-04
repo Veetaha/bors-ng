@@ -5,13 +5,7 @@ FROM elixir:${ELIXIR_VERSION} as builder
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 
-RUN apt-get update -q && apt-get --no-install-recommends install -y apt-utils ca-certificates build-essential libtool autoconf curl git
-
-RUN DEBIAN_CODENAME=$(sed -n 's/VERSION=.*(\(.*\)).*/\1/p' /etc/os-release) && \
-    curl -q https://deb.nodesource.com/gpgkey/nodesource.gpg.key | apt-key add - && \
-    echo "deb http://deb.nodesource.com/node_12.x $DEBIAN_CODENAME main" | tee /etc/apt/sources.list.d/nodesource.list && \
-    apt-get update -q && \
-    apt-get --no-install-recommends install -y nodejs
+RUN apt-get update -q && apt-get --no-install-recommends install -y apt-utils ca-certificates build-essential libtool autoconf curl git nodejs npm
 
 RUN mix local.hex --force && \
     mix local.rebar --force && \
@@ -40,9 +34,9 @@ RUN if [ -d .git ]; then \
 
 ####
 
-FROM debian:bullseye-slim
+FROM debian:bookworm-slim
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8 LANGUAGE=C.UTF-8
-RUN apt-get update -q && apt-get --no-install-recommends install -y git-core libssl1.1 curl apt-utils ca-certificates
+RUN apt-get update -q && apt-get --no-install-recommends install -y git-core libssl3 curl apt-utils ca-certificates
 
 ADD ./script/docker-entrypoint /usr/local/bin/bors-ng-entrypoint
 COPY --from=builder /src/_build/prod/rel/ /app/
