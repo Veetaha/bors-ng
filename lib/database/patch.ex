@@ -24,6 +24,9 @@ defmodule BorsNG.Database.Patch do
     field(:is_single, :boolean, default: false)
     field(:is_mergeable, :boolean, default: true)
     field(:is_draft, :boolean, default: false)
+    # Set while an r+ waits for the PR statuses before the patch joins a batch.
+    field(:prerun_reviewer, :string)
+    field(:prerun_since, :utc_datetime)
     belongs_to(:author, User)
     timestamps()
   end
@@ -46,9 +49,19 @@ defmodule BorsNG.Database.Patch do
       :priority,
       :is_single,
       :is_mergeable,
-      :is_draft
+      :is_draft,
+      :prerun_reviewer,
+      :prerun_since
     ])
+    |> end_prerun_when_closed()
     |> unique_constraint(:pr_xref, name: :patches_pr_xref_index, match: :suffix)
+  end
+
+  defp end_prerun_when_closed(changeset) do
+    case fetch_change(changeset, :open) do
+      {:ok, false} -> change(changeset, prerun_reviewer: nil, prerun_since: nil)
+      _ -> changeset
+    end
   end
 
   @spec all_for_batch(Batch.id()) :: Ecto.Queryable.t()
@@ -82,7 +95,7 @@ defmodule BorsNG.Database.Patch do
     )
   end
 
-  @spec all_for_project(Project.id(), :open | :awaiting_review) :: Ecto.Queryable.t()
+  @spec all_for_project(Project.id(), :open | :awaiting_review | :prerun) :: Ecto.Queryable.t()
   def all_for_project(project_id, :open) do
     from(p in Patch,
       where: p.open,
@@ -95,6 +108,13 @@ defmodule BorsNG.Database.Patch do
     from(p in Patch.all(:awaiting_review),
       where: p.project_id == ^project_id,
       order_by: [desc: p.pr_xref]
+    )
+  end
+
+  def all_for_project(project_id, :prerun) do
+    from(p in Patch,
+      where: p.project_id == ^project_id,
+      where: not is_nil(p.prerun_since)
     )
   end
 

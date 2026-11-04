@@ -61,6 +61,16 @@ defmodule BorsNG.Database.Project do
     )
   end
 
+  @spec with_prerun() :: Ecto.Queryable.t()
+  def with_prerun do
+    from(p in Project,
+      join: pa in Patch,
+      on: p.id == pa.project_id,
+      where: not is_nil(pa.prerun_since),
+      distinct: true
+    )
+  end
+
   @spec installation_project_connection(id, module) ::
           {{:installation, Installation.xref()}, repo_xref :: integer()}
   def installation_project_connection(project_id, repo) do

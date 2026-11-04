@@ -58,8 +58,7 @@ defmodule BorsNG.Worker.Batcher.Registry do
   # Server callbacks
 
   def init(:ok) do
-    Project.active()
-    |> Repo.all()
+    (Repo.all(Project.active()) ++ Repo.all(Project.with_prerun()))
     |> Enum.map(fn %{id: id} -> id end)
     |> Enum.uniq()
     |> Enum.map(&{&1, do_start(&1)})

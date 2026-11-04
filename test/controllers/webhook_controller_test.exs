@@ -163,13 +163,16 @@ defmodule BorsNG.WebhookControllerTest do
       }
     })
 
-    %Patch{
-      project_id: proj.id,
-      pr_xref: 1,
-      commit: "foo",
-      into_branch: "master"
-    }
-    |> Repo.insert!()
+    patch =
+      %Patch{
+        project_id: proj.id,
+        pr_xref: 1,
+        commit: "foo",
+        into_branch: "master",
+        prerun_reviewer: "rvr",
+        prerun_since: DateTime.truncate(DateTime.utc_now(), :second)
+      }
+      |> Repo.insert!()
 
     body_params = %{
       "repository" => %{"id" => 13},
@@ -210,6 +213,11 @@ defmodule BorsNG.WebhookControllerTest do
       |> Map.keys()
 
     assert branches == ["master"]
+
+    patch = Repo.get!(Patch, patch.id)
+    refute patch.open
+    assert patch.prerun_reviewer == nil
+    assert patch.prerun_since == nil
   end
 
   def wait_until_other_branch_is_removed do

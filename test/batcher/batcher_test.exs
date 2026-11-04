@@ -1082,7 +1082,7 @@ defmodule BorsNG.Worker.BatcherTest do
       )
     )
 
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
     state = GitHub.ServerMock.get_state()
 
     assert state == %{
@@ -1148,7 +1148,7 @@ defmodule BorsNG.Worker.BatcherTest do
       )
     )
 
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
     state = GitHub.ServerMock.get_state()
 
     assert state == %{
@@ -1215,7 +1215,7 @@ defmodule BorsNG.Worker.BatcherTest do
       )
     )
 
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
     state = GitHub.ServerMock.get_state()
 
     assert state == %{
@@ -1291,7 +1291,7 @@ defmodule BorsNG.Worker.BatcherTest do
       )
     )
 
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
     state = GitHub.ServerMock.get_state()
 
     assert state == %{
@@ -1359,9 +1359,9 @@ defmodule BorsNG.Worker.BatcherTest do
       )
     )
 
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
-    Batcher.handle_info({:prerun_poll, 1000, {"rvr", patch}}, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
+    Batcher.handle_info(:prerun_poll, proj.id)
     state = GitHub.ServerMock.get_state()
 
     assert state == %{
@@ -1370,8 +1370,6 @@ defmodule BorsNG.Worker.BatcherTest do
                commits: %{},
                comments: %{
                  1 => [
-                   "Stopped waiting for PR status (GitHub check) without running due to duplicate requests to run. You may check Bors to see that this PR is included in a batch by one of the other requests.",
-                   "Stopped waiting for PR status (GitHub check) without running due to duplicate requests to run. You may check Bors to see that this PR is included in a batch by one of the other requests.",
                    ":clock1: Waiting for PR status (GitHub check) to be set, probably by CI. Bors will automatically try to run when all required PR statuses are set."
                  ]
                },
@@ -1379,6 +1377,179 @@ defmodule BorsNG.Worker.BatcherTest do
                files: %{"Z" => %{"bors.toml" => ~s/status = [ "ci" ]\npr_status = [ "cn" ]/}}
              }
            }
+  end
+
+  @prerun_waiting ":clock1: Waiting for PR status (GitHub check) to be set, probably by CI. Bors will automatically try to run when all required PR statuses are set."
+
+  defp start_prerun(proj, statuses) do
+    GitHub.ServerMock.put_state(%{
+      {{:installation, 91}, 14} => %{
+        branches: %{},
+        commits: %{},
+        comments: %{1 => []},
+        statuses: statuses,
+        files: %{
+          "Z" => %{"bors.toml" => ~s/status = [ "ci" ]\npr_status = [ "cn" ]/},
+          "Y" => %{"bors.toml" => ~s/status = [ "ci" ]\npr_status = [ "cn" ]/}
+        }
+      }
+    })
+
+    patch =
+      %Patch{
+        project_id: proj.id,
+        pr_xref: 1,
+        commit: "Z",
+        into_branch: "master"
+      }
+      |> Repo.insert!()
+
+    Batcher.handle_cast({:reviewed, patch.id, "rvr"}, proj.id)
+    assert prerun_comments() == [@prerun_waiting]
+    patch = Repo.get!(Patch, patch.id)
+    assert patch.prerun_reviewer == "rvr"
+    assert patch.prerun_since != nil
+    patch
+  end
+
+  defp put_prerun_status(commit, context, state) do
+    GitHub.ServerMock.put_state(
+      put_in(
+        GitHub.ServerMock.get_state(),
+        [{{:installation, 91}, 14}, :statuses, commit, context],
+        state
+      )
+    )
+  end
+
+  defp prerun_comments do
+    GitHub.ServerMock.get_state()[{{:installation, 91}, 14}].comments[1]
+  end
+
+  defp assert_prerun_batched(proj, patch) do
+    assert [batch] = Repo.all(Batch.all_for_project(proj.id, :waiting))
+
+    assert [%{patch_id: patch_id, reviewer: "rvr"}] =
+             Repo.all(LinkPatchBatch.from_batch(batch.id))
+
+    assert patch_id == patch.id
+    assert_prerun_cleared(patch)
+  end
+
+  defp assert_prerun_cleared(patch) do
+    patch = Repo.get!(Patch, patch.id)
+    assert patch.prerun_reviewer == nil
+    assert patch.prerun_since == nil
+  end
+
+  test "prerun wait keeps the batcher alive when no batch runs", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+
+    assert {:noreply, _} = Batcher.handle_info({:poll, :once}, proj.id)
+
+    put_prerun_status("Z", "cn", :ok)
+    Batcher.handle_info(:prerun_poll, proj.id)
+
+    assert_prerun_batched(proj, patch)
+    assert prerun_comments() == [@prerun_waiting]
+  end
+
+  test "prerun wait resumes in a fresh batcher", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+    put_prerun_status("Z", "cn", :ok)
+
+    {:ok, pid} = Batcher.start_link(proj.id)
+    # Returns after the batcher handled the poll that its init sent.
+    :sys.get_state(pid)
+    GenServer.stop(pid)
+
+    assert_prerun_batched(proj, patch)
+    assert prerun_comments() == [@prerun_waiting]
+  end
+
+  test "prerun timeout counts from prerun_since", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+
+    Batcher.handle_info(:prerun_poll, proj.id)
+    assert prerun_comments() == [@prerun_waiting]
+    assert Repo.get!(Patch, patch.id).prerun_since != nil
+
+    since = DateTime.add(DateTime.truncate(DateTime.utc_now(), :second), -31 * 60, :second)
+    Repo.update_all(where(Patch, id: ^patch.id), set: [prerun_since: since])
+    Batcher.handle_info(:prerun_poll, proj.id)
+
+    assert prerun_comments() == [
+             "GitHub status checks took too long to complete, so bors is giving up. You can adjust bors configuration to have it wait longer if you like.",
+             @prerun_waiting
+           ]
+
+    assert_prerun_cleared(patch)
+    assert {:stop, :normal, _} = Batcher.handle_info({:poll, :once}, proj.id)
+  end
+
+  test "prerun wait checks the current commit of the patch", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}, "Y" => %{"cn" => :ok}})
+
+    Repo.update_all(where(Patch, id: ^patch.id), set: [commit: "Y"])
+    Batcher.handle_info(:prerun_poll, proj.id)
+
+    assert_prerun_batched(proj, patch)
+  end
+
+  test "cancel ends the prerun wait", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+
+    Batcher.handle_cast({:cancel, patch.id}, proj.id)
+    assert_prerun_cleared(patch)
+
+    put_prerun_status("Z", "cn", :ok)
+    Batcher.handle_info(:prerun_poll, proj.id)
+
+    assert [] == Repo.all(Batch.all_for_project(proj.id, :incomplete))
+    assert prerun_comments() == [@prerun_waiting]
+    assert {:stop, :normal, _} = Batcher.handle_info({:poll, :once}, proj.id)
+  end
+
+  test "PR status of the patch commit runs the prerun check at once", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+
+    Batcher.handle_cast({:status, {"Z", "cn", :running, nil}}, proj.id)
+    assert [] == Repo.all(Batch.all_for_project(proj.id, :incomplete))
+
+    put_prerun_status("Z", "cn", :ok)
+    Batcher.handle_cast({:status, {"Z", "other", :ok, nil}}, proj.id)
+    assert [] == Repo.all(Batch.all_for_project(proj.id, :incomplete))
+
+    Batcher.handle_cast({:status, {"Z", "cn", :ok, nil}}, proj.id)
+    assert_prerun_batched(proj, patch)
+  end
+
+  test "PR status failure ends the prerun wait", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+
+    put_prerun_status("Z", "cn", :error)
+    Batcher.handle_cast({:status, {"Z", "cn", :error, nil}}, proj.id)
+
+    assert prerun_comments() == [":-1: Rejected by PR status", @prerun_waiting]
+    assert_prerun_cleared(patch)
+  end
+
+  test "failed prerun check is retried on the next poll", %{proj: proj} do
+    patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
+    state = GitHub.ServerMock.get_state()
+
+    GitHub.ServerMock.put_state(
+      update_in(state, [{{:installation, 91}, 14}], &Map.delete(&1, :statuses))
+    )
+
+    Batcher.handle_info(:prerun_poll, proj.id)
+    assert Repo.get!(Patch, patch.id).prerun_since != nil
+
+    GitHub.ServerMock.put_state(state)
+    put_prerun_status("Z", "cn", :ok)
+    Batcher.handle_info(:prerun_poll, proj.id)
+
+    assert_prerun_batched(proj, patch)
   end
 
   test "rejects a patch with a requested changes", %{proj: proj} do

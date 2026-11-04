@@ -84,6 +84,9 @@ defmodule BorsNG.Worker.Batcher do
       trunc(Confex.fetch_env!(:bors, :poll_period) * :rand.uniform(2) * 0.5)
     )
 
+    # Resumes the waits that the database has from before a restart.
+    send(self(), :prerun_poll)
+
     {:ok, project_id}
   end
 
@@ -153,24 +156,34 @@ defmodule BorsNG.Worker.Batcher do
         project = Repo.get!(Project, patch.project_id)
         repo_conn = get_repo_conn(project)
 
-        case patch_preflight(repo_conn, patch) do
+        toml = Batcher.GetBorsToml.get(repo_conn, patch.commit)
+
+        case patch_preflight(repo_conn, patch, toml) do
           {:ok, max_batch_size} ->
             run(reviewer, patch, max_batch_size)
 
           :waiting ->
-            {:ok, toml} = Batcher.GetBorsToml.get(repo_conn, patch.commit)
+            {:ok, toml} = toml
 
             case toml.prerun_timeout_sec do
               0 ->
+                clear_prerun(patch.id)
                 send_message(repo_conn, [patch], {:preflight, :timeout})
 
               _ ->
+                patch
+                |> Patch.changeset(%{
+                  prerun_reviewer: reviewer,
+                  prerun_since: DateTime.truncate(DateTime.utc_now(), :second)
+                })
+                |> Repo.update!()
+
                 send_message(repo_conn, [patch], {:preflight, :waiting})
                 Logger.info("Start Poll Patch #{patch.id} prerun")
-                Process.send_after(self(), {:prerun_poll, 0, {reviewer, patch}}, 0)
             end
 
           {:error, message} ->
+            clear_prerun(patch.id)
             send_message(repo_conn, [patch], {:preflight, message})
         end
     end
@@ -193,9 +206,19 @@ defmodule BorsNG.Worker.Batcher do
       [] ->
         :ok
     end
+
+    if state != :running do
+      project_id
+      |> Patch.all_for_project(:prerun)
+      |> where([p], p.commit == ^commit)
+      |> Repo.all()
+      |> Enum.each(&check_prerun_patch(&1, identifier))
+    end
   end
 
   def do_handle_cast({:cancel, patch_id}, _project_id) do
+    clear_prerun(patch_id)
+
     patch_id
     |> Batch.all_for_patch(:incomplete)
     |> Repo.one()
@@ -203,6 +226,10 @@ defmodule BorsNG.Worker.Batcher do
   end
 
   def do_handle_cast({:cancel_all}, project_id) do
+    project_id
+    |> Patch.all_for_project(:prerun)
+    |> Repo.update_all(set: [prerun_reviewer: nil, prerun_since: nil])
+
     waiting =
       project_id
       |> Batch.all_for_project(:waiting)
@@ -243,42 +270,16 @@ defmodule BorsNG.Worker.Batcher do
     end
   end
 
-  def handle_info({:prerun_poll, try_num, args}, proj_id) do
-    check_self(proj_id)
-    {reviewer, patch} = args
+  def handle_info(:prerun_poll, project_id) do
+    check_self(project_id)
+    Process.send_after(self(), :prerun_poll, @prerun_poll_period)
 
-    Logger.info("Continue Poll Patch #{patch.id} prerun")
+    project_id
+    |> Patch.all_for_project(:prerun)
+    |> Repo.all()
+    |> Enum.each(&check_prerun_patch/1)
 
-    project = Repo.get(Project, patch.project_id)
-    repo_conn = get_repo_conn(project)
-
-    case Repo.get(Patch.all(:awaiting_review), patch.id) do
-      nil ->
-        send_message(repo_conn, [patch], {:preflight, :duplicate})
-        Logger.info("Patch #{patch.id} already left prerun, exiting prerun poll loop")
-
-      _ ->
-        {:ok, toml} = Batcher.GetBorsToml.get(repo_conn, patch.commit)
-
-        prerun_timeout_ms = toml.prerun_timeout_sec * 1000
-        elapsed = try_num * @prerun_poll_period
-
-        case patch_preflight(repo_conn, patch) do
-          {:ok, max_batch_size} ->
-            run(reviewer, patch, max_batch_size)
-
-          :waiting when elapsed > prerun_timeout_ms ->
-            send_message(repo_conn, [patch], {:preflight, :timeout})
-
-          :waiting ->
-            Process.send_after(self(), {:prerun_poll, try_num + 1, args}, @prerun_poll_period)
-
-          {:error, message} ->
-            send_message(repo_conn, [patch], {:preflight, message})
-        end
-    end
-
-    {:noreply, proj_id}
+    {:noreply, project_id}
   end
 
   # Private implementation details
@@ -296,16 +297,101 @@ defmodule BorsNG.Worker.Batcher do
     |> sort_batches()
     |> poll_batches()
 
-    if Enum.empty?(incomplete) do
+    prerun =
+      project_id
+      |> Patch.all_for_project(:prerun)
+      |> Repo.exists?()
+
+    if Enum.empty?(incomplete) and not prerun do
       :stop
     else
       :again
     end
   end
 
+  # Takes a patch fresh from the database, so that a push to the PR
+  # is checked at its new commit. A status `context` outside of the PR
+  # statuses cannot end the wait, so it skips the check.
+  # A failed check is retried on the next poll, until the wait expires.
+  # It does not crash the batcher, because a crash cancels the batches of
+  # the project.
+  defp check_prerun_patch(patch, context \\ nil) do
+    project = Repo.get!(Project, patch.project_id)
+    repo_conn = get_repo_conn(project)
+    toml = Batcher.GetBorsToml.get(repo_conn, patch.commit)
+
+    unless prerun_context_ignored?(toml, context) do
+      do_check_prerun_patch(repo_conn, patch, toml)
+    end
+  catch
+    kind, reason ->
+      Logger.error(
+        "Prerun check of patch #{patch.id} failed: " <>
+          Exception.format(kind, reason, __STACKTRACE__)
+      )
+  end
+
+  defp do_check_prerun_patch(repo_conn, patch, toml) do
+    Logger.info("Continue Poll Patch #{patch.id} prerun")
+
+    case Repo.get(Patch.all(:awaiting_review), patch.id) do
+      nil ->
+        clear_prerun(patch.id)
+
+        if patch.open do
+          send_message(repo_conn, [patch], {:preflight, :duplicate})
+        end
+
+        Logger.info("Patch #{patch.id} already left prerun, exiting prerun poll loop")
+
+      patch ->
+        # The wait ends before the last check, so a check that keeps
+        # failing stops at the timeout.
+        expired = prerun_expired?(patch, toml)
+
+        if expired do
+          clear_prerun(patch.id)
+        end
+
+        case patch_preflight(repo_conn, patch, toml) do
+          {:ok, max_batch_size} ->
+            run(patch.prerun_reviewer, patch, max_batch_size)
+
+          :waiting when expired ->
+            send_message(repo_conn, [patch], {:preflight, :timeout})
+
+          :waiting ->
+            :ok
+
+          {:error, message} ->
+            clear_prerun(patch.id)
+            send_message(repo_conn, [patch], {:preflight, message})
+        end
+    end
+  end
+
+  defp prerun_context_ignored?({:ok, toml}, context) when context != nil do
+    context not in toml.pr_status
+  end
+
+  defp prerun_context_ignored?(_toml, _context), do: false
+
+  defp prerun_expired?(patch, {:ok, toml}) do
+    DateTime.diff(DateTime.utc_now(), patch.prerun_since) > toml.prerun_timeout_sec
+  end
+
+  defp prerun_expired?(_patch, {:error, _}), do: false
+
+  defp clear_prerun(patch_id) do
+    Patch
+    |> where([p], p.id == ^patch_id)
+    |> Repo.update_all(set: [prerun_reviewer: nil, prerun_since: nil])
+  end
+
   defp run(reviewer, patch, max_batch_size) do
     project = Repo.get!(Project, patch.project_id)
     repo_conn = get_repo_conn(project)
+    clear_prerun(patch.id)
 
     {batch, is_new_batch} =
       get_new_batch(
@@ -942,25 +1028,15 @@ defmodule BorsNG.Worker.Batcher do
     send_message(repo_conn, [patch], {:canceled, :failed})
   end
 
-  defp patch_preflight(repo_conn, patch) do
-    if Patch.ci_skip?(patch) do
-      {:error, :ci_skip}
-    else
-      toml =
-        Batcher.GetBorsToml.get(
-          repo_conn,
-          patch.commit
-        )
-
-      patch_preflight(repo_conn, patch, toml)
+  defp patch_preflight(repo_conn, patch, toml) do
+    cond do
+      Patch.ci_skip?(patch) -> {:error, :ci_skip}
+      match?({:error, _}, toml) -> {:ok, nil}
+      true -> preflight_checks(repo_conn, patch, elem(toml, 1))
     end
   end
 
-  defp patch_preflight(_repo_conn, _patch, {:error, _}) do
-    {:ok, nil}
-  end
-
-  defp patch_preflight(repo_conn, patch, {:ok, toml}) do
+  defp preflight_checks(repo_conn, patch, toml) do
     passed_label =
       repo_conn
       |> GitHub.get_labels!(patch.pr_xref)
