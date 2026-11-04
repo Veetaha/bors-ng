@@ -19,6 +19,7 @@ defmodule BorsNG.Database.Migrate do
     :postgrex,
     :myxql,
     :ecto,
+    :ecto_sql,
     :confex
   ]
 
@@ -37,10 +38,12 @@ defmodule BorsNG.Database.Migrate do
     BorsNG.Application.set_repo()
 
     Enum.each(@start_apps, &Application.ensure_all_started/1)
-    Enum.each(repos(), & &1.start_link(pool_size: 3))
 
     Enum.each(repos(), fn repo ->
-      case create_storage_for(repo) do
+      storage = create_storage_for(repo)
+      {:ok, _} = repo.start_link(pool_size: 3)
+
+      case storage do
         :seed ->
           run_migrations_for(repo)
           run_seeds_for(repo)
@@ -52,6 +55,20 @@ defmodule BorsNG.Database.Migrate do
   end
 
   def create_storage_for(repo) do
+    # Hosted databases such as Heroku Postgres deny the connection to the
+    # maintenance database that creates the storage. Skip the creation when
+    # the database is there already.
+    if database_reachable?(repo), do: :migrate, else: storage_up(repo)
+  end
+
+  defp database_reachable?(repo) do
+    {:ok, _} = repo.start_link(pool_size: 1)
+    reachable = match?({:ok, _}, Ecto.Adapters.SQL.query(repo, "SELECT 1", []))
+    repo.stop()
+    reachable
+  end
+
+  defp storage_up(repo) do
     case repo.__adapter__.storage_up(repo.config) do
       :ok ->
         :seed
