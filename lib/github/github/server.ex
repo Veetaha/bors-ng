@@ -193,9 +193,10 @@ defmodule BorsNG.GitHub.Server do
   end
 
   def do_handle_call(:push, repo_conn, {sha, to}) do
-    repo_conn
-    |> patch!("git/refs/heads/#{to}", Jason.encode!(%{sha: sha}))
-    |> case do
+    resp = patch!(repo_conn, "git/refs/heads/#{to}", Jason.encode!(%{sha: sha}))
+    log_write(repo_conn, "ref update", [branch: to, sha: sha], resp)
+
+    case resp do
       %{body: _, status: 200} ->
         {:ok, sha}
 
@@ -333,14 +334,16 @@ defmodule BorsNG.GitHub.Server do
         })
       end
 
-    repo_conn
-    |> post!("git/commits", Jason.encode!(msg))
-    |> case do
+    resp = post!(repo_conn, "git/commits", Jason.encode!(msg))
+
+    case resp do
       %{body: raw, status: 201} ->
         sha = Jason.decode!(raw)["sha"]
+        log_write(repo_conn, "commit create", [branch: branch, parents: parents, sha: sha], resp)
         do_handle_call(:force_push, repo_conn, {sha, branch})
 
       %{body: body, status: status, headers: headers} ->
+        log_write(repo_conn, "commit create", [branch: branch, parents: parents], resp)
         {:error, :synthesize_commit, status, body, Map.new(headers)["x-github-request-id"]}
     end
   end
@@ -351,10 +354,10 @@ defmodule BorsNG.GitHub.Server do
     |> case do
       %{status: 404} ->
         msg = %{ref: "refs/heads/#{to}", sha: sha}
+        resp = post!(repo_conn, "git/refs", Jason.encode!(msg))
+        log_write(repo_conn, "ref create", [branch: to, sha: sha], resp)
 
-        repo_conn
-        |> post!("git/refs", Jason.encode!(msg))
-        |> case do
+        case resp do
           %{status: 201} ->
             {:ok, sha}
 
@@ -363,12 +366,14 @@ defmodule BorsNG.GitHub.Server do
         end
 
       %{body: raw, status: 200} ->
-        if sha != Jason.decode!(raw)["commit"]["sha"] do
-          msg = %{force: true, sha: sha}
+        current = Jason.decode!(raw)["commit"]["sha"]
 
-          repo_conn
-          |> patch!("git/refs/heads/#{to}", Jason.encode!(msg))
-          |> case do
+        if sha != current do
+          msg = %{force: true, sha: sha}
+          resp = patch!(repo_conn, "git/refs/heads/#{to}", Jason.encode!(msg))
+          log_write(repo_conn, "ref force update", [branch: to, before: current, sha: sha], resp)
+
+          case resp do
             %{status: 200} ->
               {:ok, sha}
 
@@ -376,6 +381,8 @@ defmodule BorsNG.GitHub.Server do
               {:error, :force_push, status, body}
           end
         else
+          log_write(repo_conn, "ref force update skipped", branch: to, before: current, sha: sha)
+
           {:ok, sha}
         end
 
@@ -957,7 +964,27 @@ defmodule BorsNG.GitHub.Server do
     {raw, state}
   end
 
-  defp tesla_client(authorization, content_type \\ @content_type) do
+  defp log_write({_, repo_xref}, kind, fields, resp \\ nil) do
+    resp_fields =
+      if resp do
+        [status: resp.status, github_request_id: Tesla.get_header(resp, "x-github-request-id")]
+      else
+        []
+      end
+
+    Logger.info(fn ->
+      fields =
+        Enum.map([repo: repo_xref] ++ fields ++ resp_fields, fn
+          {key, values} when is_list(values) -> "#{key}=#{Enum.join(values, ",")}"
+          {key, value} -> "#{key}=#{value}"
+        end)
+
+      "GitHub #{kind}: #{Enum.join(fields, " ")}"
+    end)
+  end
+
+  @doc false
+  def tesla_client(authorization, content_type \\ @content_type) do
     middleware = [
       {Tesla.Middleware.BaseUrl, site()},
       {Tesla.Middleware.Headers,
@@ -966,7 +993,9 @@ defmodule BorsNG.GitHub.Server do
          {"accept", content_type},
          {"user-agent", "bors-ng https://bors.tech"}
        ]},
-      {Tesla.Middleware.Retry, delay: 100, max_retries: 5}
+      {GitHub.RequestLog, :request},
+      {Tesla.Middleware.Retry, delay: 100, max_retries: 5},
+      {GitHub.RequestLog, :attempt}
     ]
 
     middleware =

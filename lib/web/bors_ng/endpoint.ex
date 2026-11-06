@@ -30,7 +30,7 @@ defmodule BorsNG.Endpoint do
   end
 
   plug(Plug.RequestId)
-  plug(Plug.Logger)
+  plug(BorsNG.RequestLoggerPlug)
 
   plug(BorsNG.WebhookParserPlug,
     secret:
