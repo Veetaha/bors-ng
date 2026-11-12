@@ -10,14 +10,19 @@ defmodule BorsNG.Worker.Batcher.Supervisor do
     DynamicSupervisor.start_link(__MODULE__, :ok, name: @name)
   end
 
-  @spec start(BorsNG.Database.Project.id()) :: {:ok, pid}
+  @spec start(BorsNG.Database.Project.id()) :: pid
   def start(project_id) do
     spec = %{
       id: {BorsNG.Worker.Batcher, project_id},
-      start: {BorsNG.Worker.Batcher, :start_link, [project_id]}
+      start: {BorsNG.Worker.Batcher, :start_link, [project_id]},
+      # A batcher stops when the project has nothing to do.
+      restart: :transient
     }
 
-    DynamicSupervisor.start_child(@name, spec)
+    case DynamicSupervisor.start_child(@name, spec) do
+      {:ok, pid} -> pid
+      {:error, {:already_started, pid}} -> pid
+    end
   end
 
   def init(:ok) do

@@ -1454,6 +1454,21 @@ defmodule BorsNG.Worker.BatcherTest do
     assert prerun_comments() == [@prerun_waiting]
   end
 
+  test "a project has one batcher at a time", %{proj: proj} do
+    pid = Batcher.Registry.get(proj.id)
+    assert Batcher.Registry.get(proj.id) == pid
+    assert {:error, {:already_started, ^pid}} = Batcher.start_link(proj.id)
+
+    ref = Process.monitor(pid)
+    GenServer.stop(pid)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
+
+    new_pid = Batcher.Registry.get(proj.id)
+    assert new_pid != pid
+    assert Process.alive?(new_pid)
+    GenServer.stop(new_pid)
+  end
+
   test "prerun wait resumes in a fresh batcher", %{proj: proj} do
     patch = start_prerun(proj, %{"Z" => %{"cn" => :running}})
     put_prerun_status("Z", "cn", :ok)

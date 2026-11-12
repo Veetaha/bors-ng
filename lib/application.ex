@@ -55,6 +55,7 @@ defmodule BorsNG.Application do
         start: {Confex.fetch_env!(:bors, :server), :start_link, []}
       },
       %{type: :worker, id: BorsNG.Attrs, start: {BorsNG.Attrs, :start_link, []}},
+      {Registry, keys: :unique, name: BorsNG.Worker.Batcher.Names},
       %{
         type: :supervisor,
         id: BorsNG.Worker.Batcher.Supervisor,
